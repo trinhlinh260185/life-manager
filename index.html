@@ -544,15 +544,13 @@
 
   <div class="tabs">
     <div class="tab-btn active" data-tab="today">📅 Hôm nay</div>
-    <div class="tab-btn" data-tab="work">💼 Công việc</div>
-    <div class="tab-btn" data-tab="home">🏠 Nhà cửa</div>
+    <div class="tab-btn" data-tab="month">🗓️ Tháng này</div>
     <div class="tab-btn" data-tab="health">💪 Sức khỏe</div>
     <div class="tab-btn" data-tab="plan">🗓 Kế hoạch</div>
   </div>
 
   <div class="tab-panel active" id="panel-today"></div>
-  <div class="tab-panel" id="panel-work"></div>
-  <div class="tab-panel" id="panel-home"></div>
+  <div class="tab-panel" id="panel-month"></div>
   <div class="tab-panel" id="panel-health"></div>
   <div class="tab-panel" id="panel-plan"></div>
 
@@ -937,17 +935,22 @@ function groupByTime(list) {
   return groups;
 }
 
-function buildTaskRow(container, task, showTag, editable) {
+function buildTaskRow(container, task, showTag, editable, badgeDateFn) {
   const comp = getTodayCompletion();
   const isDone = !!comp.tasks[task.id];
   const row = document.createElement('div');
   row.className = 'task-row' + (isDone ? ' done' : '');
+  // badgeDateFn (nếu có) trả về 1 Date cụ thể cho task này — hiện ngày cụ thể
+  // (vd "10/07") thay cho mô tả quy tắc lặp (vd "Hàng tháng (ngày 10)").
+  // Không truyền badgeDateFn thì giữ nguyên hành vi cũ (mô tả quy tắc).
+  const badgeDate = badgeDateFn ? badgeDateFn(task) : null;
+  const badgeText = badgeDate ? formatDate(ymd(badgeDate)) : describeRecurrence(task);
   row.innerHTML = `
     <input type="checkbox" ${isDone ? 'checked' : ''}>
     ${showTag ? `<span class="tag ${task.type}">${task.type === 'work' ? 'Công ty' : 'Nhà'}</span>` : ''}
     <span class="task-title">${escapeHtml(task.title)}</span>
     ${task.expectedTime ? `<span class="time-badge">${task.expectedTime}</span>` : ''}
-    <span class="rec-badge">${describeRecurrence(task)}</span>
+    <span class="rec-badge">${badgeText}</span>
     ${editable ? `<button class="icon-btn edit-task" title="Sửa">✎</button><button class="icon-btn danger del-task" title="Xoá">✕</button>` : ''}
   `;
   row.querySelector('input').addEventListener('change', async (e) => {
@@ -970,12 +973,12 @@ function buildTaskRow(container, task, showTag, editable) {
   return row;
 }
 
-function renderTaskGroup(container, tasks, showTag, editable, flat) {
+function renderTaskGroup(container, tasks, showTag, editable, flat, badgeDateFn) {
   const comp = getTodayCompletion();
 
   if (flat) {
-    // Dùng cho Hôm nay / Công việc / Nhà cửa: không hiện nhãn Sáng/Chiều/Tối,
-    // việc đã hoàn thành hôm nay tự động đẩy xuống dưới cùng.
+    // Dùng cho Hôm nay / Tháng này / Toàn bộ danh sách việc: không hiện nhãn
+    // Sáng/Chiều/Tối, việc đã hoàn thành hôm nay tự động đẩy xuống dưới cùng.
     const groups = groupByTime(tasks);
     let ordered = [];
     TIME_ORDER.forEach(time => { ordered = ordered.concat(groups[time]); });
@@ -990,7 +993,7 @@ function renderTaskGroup(container, tasks, showTag, editable, flat) {
       return;
     }
     finalList.forEach(task => {
-      container.appendChild(buildTaskRow(container, task, showTag, editable));
+      container.appendChild(buildTaskRow(container, task, showTag, editable, badgeDateFn));
     });
     return;
   }
@@ -1006,7 +1009,7 @@ function renderTaskGroup(container, tasks, showTag, editable, flat) {
     label.textContent = TIME_LABEL[time];
     container.appendChild(label);
     items.forEach(task => {
-      container.appendChild(buildTaskRow(container, task, showTag, editable));
+      container.appendChild(buildTaskRow(container, task, showTag, editable, badgeDateFn));
     });
   });
   if (!any) {
@@ -1092,41 +1095,88 @@ function buildAddTaskForm(defaultType) {
   return form;
 }
 
+function isTaskDueInMonth(task, year, month) {
+  // month: 0-11 (giống Date.getMonth()). Trả về true nếu task đến hạn vào
+  // BẤT KỲ ngày nào trong tháng đó.
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  for (let d = 1; d <= daysInMonth; d++) {
+    if (isTaskDueOn(task, new Date(year, month, d))) return true;
+  }
+  return false;
+}
+
+function nearestDueDateInMonth(task, year, month, todayObj) {
+  // Trả về ngày cụ thể (Date) để hiện badge trong tháng đang xem:
+  // ưu tiên ngày sắp tới gần nhất (>= hôm nay) trong tháng; nếu việc chỉ còn
+  // (các) ngày đến hạn đã qua trong tháng này thì lấy ngày gần nhất đã qua đó.
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const todayDay = (todayObj.getFullYear() === year && todayObj.getMonth() === month) ? todayObj.getDate() : null;
+  let upcoming = null;
+  let past = null;
+  for (let d = 1; d <= daysInMonth; d++) {
+    if (!isTaskDueOn(task, new Date(year, month, d))) continue;
+    if (todayDay === null || d >= todayDay) {
+      if (upcoming === null) upcoming = new Date(year, month, d);
+    } else {
+      past = new Date(year, month, d);
+    }
+  }
+  return upcoming || past;
+}
+
+let todaySubTab = 'work';
 function renderToday() {
   const panel = document.getElementById('panel-today');
   panel.innerHTML = '';
+
+  const subtabs = document.createElement('div');
+  subtabs.className = 'subtabs';
+  subtabs.innerHTML = `
+    <button class="subtab-btn ${todaySubTab==='work'?'active':''}" data-sub="work">💼 Công việc</button>
+    <button class="subtab-btn ${todaySubTab==='home'?'active':''}" data-sub="home">🏠 Nhà cửa</button>
+  `;
+  subtabs.querySelectorAll('.subtab-btn').forEach(btn => {
+    btn.addEventListener('click', () => { todaySubTab = btn.dataset.sub; renderToday(); });
+  });
+  panel.appendChild(subtabs);
+
   const card = document.createElement('div');
   card.className = 'card';
-  card.innerHTML = `<div class="section-title-row"><h2>📅 Việc hôm nay</h2></div>`;
+  const titleText = todaySubTab === 'work' ? '📅 Việc công ty hôm nay' : '📅 Việc nhà hôm nay';
+  card.innerHTML = `<div class="section-title-row"><h2>${titleText}</h2></div>`;
   const list = document.createElement('div');
   card.appendChild(list);
   const todayObj = new Date();
-  const dueTasks = DATA.tasks.filter(t => isTaskDueOn(t, todayObj));
-  renderTaskGroup(list, dueTasks, true, false, true);
+  const dueTasks = DATA.tasks.filter(t => t.type === todaySubTab && isTaskDueOn(t, todayObj));
+  renderTaskGroup(list, dueTasks, false, false, true, () => todayObj);
   panel.appendChild(card);
 }
 
-function renderWork() {
-  const panel = document.getElementById('panel-work');
+let monthSubTab = 'work';
+function renderMonth() {
+  const panel = document.getElementById('panel-month');
   panel.innerHTML = '';
-  const card = document.createElement('div');
-  card.className = 'card';
-  card.innerHTML = `<h2>💼 Công việc</h2>`;
-  const list = document.createElement('div');
-  card.appendChild(list);
-  renderTaskGroup(list, DATA.tasks.filter(t => t.type === 'work'), false, false, true);
-  panel.appendChild(card);
-}
 
-function renderHome() {
-  const panel = document.getElementById('panel-home');
-  panel.innerHTML = '';
+  const subtabs = document.createElement('div');
+  subtabs.className = 'subtabs';
+  subtabs.innerHTML = `
+    <button class="subtab-btn ${monthSubTab==='work'?'active':''}" data-sub="work">💼 Công việc</button>
+    <button class="subtab-btn ${monthSubTab==='home'?'active':''}" data-sub="home">🏠 Nhà cửa</button>
+  `;
+  subtabs.querySelectorAll('.subtab-btn').forEach(btn => {
+    btn.addEventListener('click', () => { monthSubTab = btn.dataset.sub; renderMonth(); });
+  });
+  panel.appendChild(subtabs);
+
   const card = document.createElement('div');
   card.className = 'card';
-  card.innerHTML = `<h2>🏠 Nhà cửa</h2>`;
+  const titleText = monthSubTab === 'work' ? '🗓️ Việc công ty trong tháng này' : '🗓️ Việc nhà trong tháng này';
+  card.innerHTML = `<h2>${titleText}</h2>`;
   const list = document.createElement('div');
   card.appendChild(list);
-  renderTaskGroup(list, DATA.tasks.filter(t => t.type === 'home'), false, false, true);
+  const now = new Date();
+  const monthTasks = DATA.tasks.filter(t => t.type === monthSubTab && isTaskDueInMonth(t, now.getFullYear(), now.getMonth()));
+  renderTaskGroup(list, monthTasks, false, false, true, (t) => nearestDueDateInMonth(t, now.getFullYear(), now.getMonth(), now));
   panel.appendChild(card);
 }
 
@@ -1758,13 +1808,11 @@ function renderPlan() {
 let currentTab = 'today';
 function renderCurrentTab() {
   document.getElementById('panel-today').classList.toggle('active', currentTab === 'today');
-  document.getElementById('panel-work').classList.toggle('active', currentTab === 'work');
-  document.getElementById('panel-home').classList.toggle('active', currentTab === 'home');
+  document.getElementById('panel-month').classList.toggle('active', currentTab === 'month');
   document.getElementById('panel-health').classList.toggle('active', currentTab === 'health');
   document.getElementById('panel-plan').classList.toggle('active', currentTab === 'plan');
   if (currentTab === 'today') renderToday();
-  else if (currentTab === 'work') renderWork();
-  else if (currentTab === 'home') renderHome();
+  else if (currentTab === 'month') renderMonth();
   else if (currentTab === 'health') renderHealth();
   else if (currentTab === 'plan') renderPlan();
 }
