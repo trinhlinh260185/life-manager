@@ -987,7 +987,7 @@ function buildTaskRow(container, task, showTag, editable, badgeDateFn) {
   return row;
 }
 
-function renderTaskGroup(container, tasks, showTag, editable, flat, badgeDateFn) {
+function renderTaskGroup(container, tasks, showTag, editable, flat, badgeDateFn, sortDateFn) {
   const comp = getTodayCompletion();
 
   if (flat) {
@@ -996,6 +996,25 @@ function renderTaskGroup(container, tasks, showTag, editable, flat, badgeDateFn)
     const groups = groupByTime(tasks);
     let ordered = [];
     TIME_ORDER.forEach(time => { ordered = ordered.concat(groups[time]); });
+    if (sortDateFn) {
+      // Sắp xếp theo ngày đến hạn: việc sắp đến hạn gần nhất lên trước
+      // (thêm 07/07/2026 theo yêu cầu của Linh). Việc có ngày đến hạn ĐÃ QUA
+      // (chỉ xảy ra ở tab Tháng này với việc đã hết lượt trong tháng) và việc
+      // không tính được ngày (null) bị đẩy xuống cuối. Khi cùng ngày, giữ
+      // nguyên thứ tự theo giờ dự kiến như cũ (sort ổn định + index dự phòng).
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const PAST_OFFSET = 8.64e15; // đủ lớn để mọi ngày đã qua xếp sau mọi ngày sắp tới
+      const sortKey = (t) => {
+        const d = sortDateFn(t);
+        if (!d) return Infinity;
+        return d.getTime() < todayStart.getTime() ? d.getTime() + PAST_OFFSET : d.getTime();
+      };
+      ordered = ordered
+        .map((t, i) => ({ t, i, k: sortKey(t) }))
+        .sort((a, b) => a.k - b.k || a.i - b.i)
+        .map(x => x.t);
+    }
     const incomplete = ordered.filter(t => !comp.tasks[t.id]);
     const done = ordered.filter(t => !!comp.tasks[t.id]);
     const finalList = incomplete.concat(done);
@@ -1201,7 +1220,8 @@ function renderMonth() {
   card.appendChild(list);
   const now = new Date();
   const monthTasks = DATA.tasks.filter(t => t.type === monthSubTab && isTaskDueInMonth(t, now.getFullYear(), now.getMonth()));
-  renderTaskGroup(list, monthTasks, false, false, true, (t) => nearestDueDateInMonth(t, now.getFullYear(), now.getMonth(), now));
+  const monthDateFn = (t) => nearestDueDateInMonth(t, now.getFullYear(), now.getMonth(), now);
+  renderTaskGroup(list, monthTasks, false, false, true, monthDateFn, monthDateFn);
   panel.appendChild(card);
 }
 
@@ -1762,7 +1782,9 @@ function renderPlan() {
     listCard.innerHTML = `<h2>📋 Toàn bộ danh sách việc</h2>`;
     const list = document.createElement('div');
     listCard.appendChild(list);
-    renderTaskGroup(list, DATA.tasks, true, true, true);
+    // Xếp theo lần đến hạn kế tiếp gần nhất (badge vẫn hiện mô tả quy tắc lặp
+    // như cũ — chỉ đổi THỨ TỰ, không đổi nội dung badge).
+    renderTaskGroup(list, DATA.tasks, true, true, true, null, (t) => nextOccurrence(t, new Date()));
     panel.appendChild(listCard);
     return;
   }
