@@ -15,6 +15,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&family=Nunito:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   /* Theme lấy cảm hứng từ bức tranh cô gái tóc vàng + hoa hồng trắng trên nền đỏ gạch:
      đỏ gạch (--terracotta) + vàng gold (--gold, tóc) + xanh rêu đậm (--mint, lá hồng)
@@ -580,6 +581,18 @@
     </div>
   </div>
 
+  <div class="card">
+    <h2>🔗 Đồng bộ Google Calendar</h2>
+    <div style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">
+      Chỉ đồng bộ các việc CÓ đặt giờ dự kiến — mỗi việc sẽ thành 1 sự kiện trên Google Calendar của Linh, kèm nhắc trước 30 phút. Cần đăng nhập lại sau một thời gian (Google giới hạn phiên ~1 tiếng vì đây là app cá nhân chưa qua xác minh của Google).
+    </div>
+    <div class="add-form" style="margin-top:0;">
+      <button id="gcalSignInBtn">🔑 Đăng nhập Google</button>
+      <button id="gcalSyncBtn">🔄 Đồng bộ ngay</button>
+    </div>
+    <div id="gcalStatus" style="font-size:0.8rem; color:var(--text-muted); margin-top:8px;">Chưa đăng nhập.</div>
+  </div>
+
   <footer><span>Dữ liệu được lưu tự động trên thiết bị này</span></footer>
 </div>
 
@@ -964,6 +977,7 @@ function buildTaskRow(container, task, showTag, editable, badgeDateFn) {
     });
     row.querySelector('.del-task').addEventListener('click', async () => {
       if (confirm('Xoá việc này?')) {
+        if (task.googleEventId) await deleteTaskFromGoogle(task);
         DATA.tasks = DATA.tasks.filter(t => t.id !== task.id);
         await saveKey(KEYS.tasks, DATA.tasks);
         renderCurrentTab();
@@ -1060,6 +1074,13 @@ function openTaskEditForm(row, task, container, showTag) {
     task.recurrence = recControls.getRecurrence();
     await saveKey(KEYS.tasks, DATA.tasks);
     renderCurrentTab();
+    if (gcalAccessToken) {
+      if (task.expectedTime) {
+        syncTaskToGoogle(task).then(() => saveKey(KEYS.tasks, DATA.tasks));
+      } else if (task.googleEventId) {
+        deleteTaskFromGoogle(task).then(() => saveKey(KEYS.tasks, DATA.tasks));
+      }
+    }
   });
 }
 
@@ -1088,9 +1109,13 @@ function buildAddTaskForm(defaultType) {
     const expectedTime = form.querySelector('.new-expected').value || '';
     const time = timeGroupFromExpected(expectedTime);
     const recurrence = recControls.getRecurrence();
-    DATA.tasks.push({ id: uid(), title, type, time, expectedTime, recurrence });
+    const newTask = { id: uid(), title, type, time, expectedTime, recurrence, googleEventId: null };
+    DATA.tasks.push(newTask);
     await saveKey(KEYS.tasks, DATA.tasks);
     renderCurrentTab();
+    if (gcalAccessToken && newTask.expectedTime) {
+      syncTaskToGoogle(newTask).then(() => saveKey(KEYS.tasks, DATA.tasks));
+    }
   });
   return form;
 }
@@ -1816,6 +1841,192 @@ function renderCurrentTab() {
   else if (currentTab === 'health') renderHealth();
   else if (currentTab === 'plan') renderPlan();
 }
+
+// ==================== ĐỒNG BỘ GOOGLE CALENDAR ====================
+// Dán Client ID lấy từ Google Cloud Console (OAuth 2.0 Client ID, loại "Web
+// application") vào đây. Client ID KHÔNG phải bí mật (không phải mật khẩu),
+// an toàn khi để thẳng trong code công khai như thế này.
+const GOOGLE_CLIENT_ID = "75223449936-au44lfs65nbd3pnjeo2opu5p5iiic5jb.apps.googleusercontent.com";
+const GCAL_REMINDER_MINUTES = 30; // báo trước 30 phút, theo yêu cầu của Linh
+const GCAL_EVENT_DURATION_MINUTES = 30; // độ dài mỗi sự kiện trên Calendar
+
+let gcalAccessToken = null;
+let gcalTokenClient = null;
+
+function updateGcalStatus(text) {
+  const el = document.getElementById('gcalStatus');
+  if (el) el.textContent = text;
+}
+
+function isGoogleConfigured() {
+  return GOOGLE_CLIENT_ID && !GOOGLE_CLIENT_ID.startsWith('DÁN_CLIENT_ID');
+}
+
+function initGoogleAuth() {
+  if (!isGoogleConfigured()) {
+    updateGcalStatus('Chưa cấu hình Client ID — xem hướng dẫn để lấy Client ID từ Google Cloud Console.');
+    return;
+  }
+  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+    // Thư viện Google Identity Services (script trong <head>) chưa tải xong,
+    // hoặc bị mạng chặn — thử lại sau 1 giây.
+    setTimeout(initGoogleAuth, 1000);
+    return;
+  }
+  gcalTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: 'https://www.googleapis.com/auth/calendar.events',
+    callback: (resp) => {
+      if (resp.error) {
+        updateGcalStatus('Đăng nhập thất bại: ' + resp.error);
+        return;
+      }
+      gcalAccessToken = resp.access_token;
+      updateGcalStatus('Đã đăng nhập. Đang đồng bộ...');
+      fullGoogleSync();
+    }
+  });
+}
+
+// Quy đổi quy tắc lặp của task sang RRULE của Google Calendar. Trả về null
+// nếu không lặp (once) hoặc không map được gọn gàng (monthend — loại này xử
+// lý riêng bằng cách chỉ đẩy 1 sự kiện cho lần đến hạn sắp tới, dời dần theo
+// từng lần đồng bộ, xem resolveEventDate()).
+const GCAL_WEEKDAY = ['SU','MO','TU','WE','TH','FR','SA'];
+function buildRRule(recurrence) {
+  const rec = recurrence || { type: 'daily' };
+  if (rec.type === 'daily') return 'RRULE:FREQ=DAILY';
+  if (rec.type === 'weekly') {
+    const days = (rec.days || []).slice().sort().map(d => GCAL_WEEKDAY[d]).join(',');
+    if (!days) return null;
+    return 'RRULE:FREQ=WEEKLY;BYDAY=' + days;
+  }
+  if (rec.type === 'periodic') {
+    const interval = rec.intervalMonths || 1;
+    if (interval === 12) {
+      return 'RRULE:FREQ=YEARLY;BYMONTH=' + (rec.anchorMonth || 1) + ';BYMONTHDAY=' + rec.day;
+    }
+    return 'RRULE:FREQ=MONTHLY;INTERVAL=' + interval + ';BYMONTHDAY=' + rec.day;
+  }
+  return null; // monthend, once
+}
+
+// Ngày cụ thể (chuỗi 'YYYY-MM-DD') dùng làm ngày bắt đầu sự kiện.
+function resolveEventDate(task) {
+  const rec = task.recurrence || { type: 'daily' };
+  if (rec.type === 'once') return rec.date || null;
+  const next = nextOccurrence(task, new Date());
+  return next ? ymd(next) : null;
+}
+
+function buildGcalEventPayload(task) {
+  if (!task.expectedTime) return null;
+  const dateStr = resolveEventDate(task);
+  if (!dateStr) return null;
+  const startDateTime = dateStr + 'T' + task.expectedTime + ':00';
+  const endObj = new Date(dateStr + 'T' + task.expectedTime + ':00');
+  endObj.setMinutes(endObj.getMinutes() + GCAL_EVENT_DURATION_MINUTES);
+  const endDateTime = ymd(endObj) + 'T' + String(endObj.getHours()).padStart(2,'0') + ':' + String(endObj.getMinutes()).padStart(2,'0') + ':00';
+  const payload = {
+    summary: task.title,
+    start: { dateTime: startDateTime, timeZone: 'Asia/Ho_Chi_Minh' },
+    end: { dateTime: endDateTime, timeZone: 'Asia/Ho_Chi_Minh' },
+    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: GCAL_REMINDER_MINUTES }] }
+  };
+  const rrule = buildRRule(task.recurrence);
+  if (rrule) payload.recurrence = [rrule];
+  return payload;
+}
+
+async function syncTaskToGoogle(task) {
+  if (!gcalAccessToken) return;
+  const payload = buildGcalEventPayload(task);
+  if (!payload) return;
+  try {
+    let resp;
+    if (task.googleEventId) {
+      resp = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events/' + task.googleEventId, {
+        method: 'PUT',
+        headers: { 'Authorization': 'Bearer ' + gcalAccessToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (resp.status === 404) {
+        // Sự kiện đã bị xoá thẳng trên Google Calendar rồi — tạo lại mới.
+        task.googleEventId = null;
+        return syncTaskToGoogle(task);
+      }
+    } else {
+      resp = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + gcalAccessToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    }
+    if (resp.status === 401) {
+      gcalAccessToken = null;
+      updateGcalStatus('Phiên đăng nhập Google đã hết hạn — bấm "Đăng nhập Google" lại rồi đồng bộ tiếp.');
+      return;
+    }
+    if (!resp.ok) {
+      console.warn('Lỗi đồng bộ Google Calendar cho việc "' + task.title + '":', await resp.text());
+      return;
+    }
+    const data = await resp.json();
+    task.googleEventId = data.id;
+  } catch (e) {
+    console.warn('Lỗi mạng khi đồng bộ Google Calendar:', e);
+  }
+}
+
+async function deleteTaskFromGoogle(task) {
+  if (!task.googleEventId || !gcalAccessToken) { task.googleEventId = null; return; }
+  try {
+    await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events/' + task.googleEventId, {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + gcalAccessToken }
+    });
+  } catch (e) {
+    console.warn('Lỗi xoá sự kiện trên Google Calendar:', e);
+  }
+  task.googleEventId = null;
+}
+
+async function fullGoogleSync() {
+  if (!isGoogleConfigured()) {
+    updateGcalStatus('Chưa cấu hình Client ID — xem hướng dẫn để lấy Client ID từ Google Cloud Console.');
+    return;
+  }
+  if (!gcalAccessToken) {
+    updateGcalStatus('Chưa đăng nhập Google — bấm "Đăng nhập Google" trước.');
+    return;
+  }
+  updateGcalStatus('Đang đồng bộ...');
+  for (const task of DATA.tasks) {
+    if (task.expectedTime) {
+      await syncTaskToGoogle(task);
+    } else if (task.googleEventId) {
+      await deleteTaskFromGoogle(task);
+    }
+  }
+  await saveKey(KEYS.tasks, DATA.tasks);
+  updateGcalStatus('Đã đồng bộ lúc ' + new Date().toLocaleTimeString('vi-VN'));
+}
+
+document.getElementById('gcalSignInBtn').addEventListener('click', () => {
+  if (!isGoogleConfigured()) {
+    updateGcalStatus('Chưa cấu hình Client ID — xem hướng dẫn để lấy Client ID từ Google Cloud Console.');
+    return;
+  }
+  if (!gcalTokenClient) { initGoogleAuth(); }
+  if (gcalTokenClient) gcalTokenClient.requestAccessToken();
+});
+
+document.getElementById('gcalSyncBtn').addEventListener('click', () => {
+  fullGoogleSync();
+});
+
+initGoogleAuth();
+// ==================== HẾT PHẦN GOOGLE CALENDAR ====================
 
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
