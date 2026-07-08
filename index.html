@@ -593,7 +593,7 @@
     <div id="gcalStatus" style="font-size:0.8rem; color:var(--text-muted); margin-top:8px;">Chưa đăng nhập.</div>
   </div>
 
-  <footer><span>Dữ liệu được lưu tự động trên thiết bị này · Phiên bản 07/07/2026-D</span></footer>
+  <footer><span>Dữ liệu được lưu tự động trên thiết bị này · Phiên bản 08/07/2026-E</span></footer>
 </div>
 
 <script>
@@ -770,11 +770,17 @@ async function saveKey(key, value, attempt) {
 }
 
 function getTodayCompletion() {
-  const t = todayStr();
-  if (!DATA.completions[t]) {
-    DATA.completions[t] = { tasks: {}, habits: {}, workouts: {} };
+  return getCompletionFor(todayStr());
+}
+
+// Lấy (và tạo nếu chưa có) bảng tick của một ngày bất kỳ ('YYYY-MM-DD').
+// Dùng cho tab Tháng này: dấu tick gắn theo NGÀY ĐẾN HẠN của việc, không phải
+// ngày đang xem — nhờ đó qua ngày mới, việc tháng đã tick không bị "mất tick".
+function getCompletionFor(dateStr) {
+  if (!DATA.completions[dateStr]) {
+    DATA.completions[dateStr] = { tasks: {}, habits: {}, workouts: {} };
   }
-  return DATA.completions[t];
+  return DATA.completions[dateStr];
 }
 
 async function saveAll() {
@@ -949,15 +955,19 @@ function groupByTime(list) {
 }
 
 function buildTaskRow(container, task, showTag, editable, badgeDateFn) {
-  const comp = getTodayCompletion();
-  const isDone = !!comp.tasks[task.id];
-  const row = document.createElement('div');
-  row.className = 'task-row' + (isDone ? ' done' : '');
   // badgeDateFn (nếu có) trả về 1 Date cụ thể cho task này — hiện ngày cụ thể
   // (vd "10/07") thay cho mô tả quy tắc lặp (vd "Hàng tháng (ngày 10)").
   // Không truyền badgeDateFn thì giữ nguyên hành vi cũ (mô tả quy tắc).
   const badgeDate = badgeDateFn ? badgeDateFn(task) : null;
   const badgeText = badgeDate ? formatDate(ymd(badgeDate)) : describeRecurrence(task);
+  // Dấu tick gắn theo NGÀY ĐẾN HẠN đang hiển thị (badge) nếu có, nếu không
+  // thì theo hôm nay như cũ. Nhờ đó ở tab Tháng này, việc đã tick cho một lần
+  // đến hạn (vd 06/07) vẫn giữ nguyên tick khi xem vào ngày sau (08/07) —
+  // sửa lỗi "qua ngày bị mất tick" Linh báo 08/07/2026.
+  const comp = badgeDate ? getCompletionFor(ymd(badgeDate)) : getTodayCompletion();
+  const isDone = !!comp.tasks[task.id];
+  const row = document.createElement('div');
+  row.className = 'task-row' + (isDone ? ' done' : '');
   row.innerHTML = `
     <input type="checkbox" ${isDone ? 'checked' : ''}>
     ${showTag ? `<span class="tag ${task.type}">${task.type === 'work' ? 'Công ty' : 'Nhà'}</span>` : ''}
@@ -1015,8 +1025,15 @@ function renderTaskGroup(container, tasks, showTag, editable, flat, badgeDateFn,
         .sort((a, b) => a.k - b.k || a.i - b.i)
         .map(x => x.t);
     }
-    const incomplete = ordered.filter(t => !comp.tasks[t.id]);
-    const done = ordered.filter(t => !!comp.tasks[t.id]);
+    // Xét "đã xong" theo cùng ngày với dấu tick của từng dòng: nếu có
+    // badgeDateFn thì theo ngày đến hạn của việc đó, không thì theo hôm nay.
+    const isDoneFor = (t) => {
+      const d = badgeDateFn ? badgeDateFn(t) : null;
+      const c = d ? getCompletionFor(ymd(d)) : comp;
+      return !!c.tasks[t.id];
+    };
+    const incomplete = ordered.filter(t => !isDoneFor(t));
+    const done = ordered.filter(t => isDoneFor(t));
     const finalList = incomplete.concat(done);
     if (finalList.length === 0) {
       const empty = document.createElement('div');
